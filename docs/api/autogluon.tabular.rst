@@ -8,4 +8,5 @@ autogluon.tabular
     :nosignatures:
     :toctree: _autogen
 
+    TabularDataset
     TabularPredictor

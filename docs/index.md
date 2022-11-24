@@ -149,7 +149,9 @@ tutorials/timeseries/timeseries_quick_start
 :hidden:
 :maxdepth: 2
 
-api/autogluon.tabular
-api/autogluon.multimodal
-api/autogluon.timeseries
+api/_autogen/autogluon.tabular.TabularDataset
+api/_autogen/autogluon.tabular.TabularPredictor
+api/_autogen/autogluon.timeseries.TimeSeriesDataFrame
+api/_autogen/autogluon.timeseries.TimeSeriesPredictor
+api/_autogen/autogluon.multimodal.MultiModalPredictor
 ```

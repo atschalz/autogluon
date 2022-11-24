@@ -8,4 +8,5 @@ autogluon.timeseries
     :nosignatures:
     :toctree: _autogen
 
+    TimeSeriesDataFrame
     TimeSeriesPredictor
