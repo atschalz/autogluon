@@ -80,7 +80,7 @@ brew install libomp.rb
 ::::
 
 ::::{dropdown} Install nightly builds
-AutoGluon offers nightly builds that can be installed using the `--pre` argument. Nightly builds have the latest features but have not been as rigurously tested as stable releases.
+AutoGluon offers nightly builds that can be installed using the `--pre` argument. Nightly builds have the latest features but have not been as rigorously tested as stable releases.
 
 ```bash
 python -m pip install --pre autogluon
