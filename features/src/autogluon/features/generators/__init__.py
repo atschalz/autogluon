@@ -21,5 +21,6 @@ from .one_hot_encoder import OneHotEncoderFeatureGenerator
 from .oof_target_encoder import OOFTargetEncodingFeatureGenerator
 from .pipeline import PipelineFeatureGenerator
 from .rename import RenameFeatureGenerator
+from .tafc import TargetAwareFeatureCompressionFeatureGenerator
 from .text_ngram import TextNgramFeatureGenerator
 from .text_special import TextSpecialFeatureGenerator
