@@ -57,6 +57,7 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         eps=1e-8,
         return_dataframe=True,
         add_low_cardinality=None,
+        max_features=None,
         random_state=42,
         **kwargs,
     ):
@@ -73,6 +74,7 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         self.add_log_transforms = add_log_transforms
         self.add_group_reliability = add_group_reliability
         self.global_shrinkage_k = global_shrinkage_k
+        self.max_features = max_features
         self.random_state = random_state
 
         self.fill_value = fill_value
@@ -95,6 +97,32 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         if unknown:
             raise ValueError(f"Unknown aggregations: {unknown}")
 
+    def _features_per_pair(self):
+        n = len(self.aggregations)  # base aggregations
+
+        # relative features
+        n += len(self.relative_to_aggs) * (
+            ("diff" in self.relative_ops) +
+            ("ratio" in self.relative_ops)
+        )
+
+        if self.add_log_transforms:
+            n += len(self.relative_to_aggs)
+
+        if self.add_zscore:
+            n += 1
+
+        if self.add_outlier_flags:
+            n += 2
+
+        if self.add_pct_rank:
+            n += 1
+
+        if self.add_group_reliability:
+            n += 3
+
+        return int(n)
+
     # ------------------------------------------------------------------
     # FIT
     # ------------------------------------------------------------------
@@ -111,7 +139,51 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
 
         X = self._to_dataframe(X)
 
+        cardinalities = X.nunique(dropna=True).sort_values(ascending=False)
+        ranked_features = cardinalities.index.tolist()
+
         self.group_stats_ = {}
+
+        features_per_pair = self._features_per_pair()
+        budget = self.max_features if self.max_features is not None else float("inf")
+        used_features = 0
+
+        # ranked by cardinality, independent of type
+        ranked_cols = (
+            X.nunique(dropna=True)
+            .sort_values(ascending=False)
+            .index
+            .tolist()
+        )
+
+        for cat in ranked_cols:
+            if cat not in self.categorical_features:
+                continue
+
+            for num in ranked_cols:
+                if num not in self.numeric_features:
+                    continue
+
+                if used_features + features_per_pair > budget:
+                    return self  # STOP: budget reached
+
+                named_aggs = {
+                    name: pd.NamedAgg(
+                        column=num,
+                        aggfunc=AGGREGATION_REGISTRY[name]
+                    )
+                    for name in self.aggregations
+                }
+
+                stats = (
+                    X.groupby(cat, observed=True)
+                    .agg(**named_aggs)
+                    .astype(float)
+                )
+
+                self.group_stats_[(cat, num)] = stats
+                used_features += features_per_pair   
+
         self.global_stats_ = {
             num: X[num].mean() for num in self.numeric_features
         }
