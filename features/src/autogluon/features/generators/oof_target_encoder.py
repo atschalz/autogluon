@@ -340,3 +340,122 @@ class OOFTargetEncodingFeatureGenerator(AbstractFeatureGenerator):
     @staticmethod
     def get_default_infer_features_in_args() -> dict:
         return dict()
+
+class OOFNumericTargetEncodingFeatureGenerator(
+    OOFTargetEncodingFeatureGenerator
+):
+    def _fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
+        self.numeric_cols_ = X.select_dtypes(include=[np.number]).columns.tolist()
+        self.passthrough_cols_ = [
+            c for c in X.columns if c not in self.numeric_cols_
+        ]
+
+        X_cat = X.copy()
+        for col in self.numeric_cols_:
+            X_cat[col] = X_cat[col].astype(str)  # IMPORTANT: str, not object
+
+        return super()._fit(X_cat, y, **kwargs)
+
+    def _fit_transform(self, X, y, **kwargs):
+        self._fit(X, y)
+
+        if self.keep_original:
+            X_out = pd.concat([X, self.train_encoded_], axis=1)
+        else:
+            X_out = self.train_encoded_.copy()
+
+        self.train_encoded_ = None
+        return X_out, dict()
+
+    def _transform(self, X, **kwargs):
+        X_cat = X.copy()
+        for col in self.numeric_cols_:
+            X_cat[col] = X_cat[col].astype(str)
+
+        return super()._transform(X_cat)
+
+class OOFFrequentNumericTargetEncodingFeatureGenerator(
+    OOFTargetEncodingFeatureGenerator
+):
+    """
+    Exact extension of:
+        OOFTargetEncodingFeatureGenerator.fit_transform(X.astype(str), y)
+
+    Adds:
+      - min_count-based rare value bucketing
+    """
+
+    RARE_LABEL = "__RARE__"
+
+    def __init__(
+        self,
+        min_count: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            **kwargs,
+        )
+        self.min_count = min_count
+
+    # ------------------------------------------------------------------
+    # Preprocessing (this is the ONLY place behavior changes)
+    # ------------------------------------------------------------------
+    def _preprocess_fit(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fit-time preprocessing:
+          - cast everything to string
+          - optionally bucket rare values
+        """
+        Xs = X.astype(str)
+
+        if self.min_count <= 1:
+            return Xs
+
+        self.frequent_values_ = {}
+
+        for col in Xs.columns:
+            vc = Xs[col].value_counts(dropna=False)
+            frequent = vc[vc >= self.min_count].index
+            self.frequent_values_[col] = set(frequent)
+
+            Xs[col] = np.where(
+                Xs[col].isin(self.frequent_values_[col]),
+                Xs[col],
+                self.RARE_LABEL,
+            )
+
+        return Xs
+
+    def _preprocess_transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform-time preprocessing:
+          - cast to string
+          - unseen / rare → __RARE__
+        """
+        Xs = X.astype(str)
+
+        if self.min_count <= 1:
+            return Xs
+
+        for col in Xs.columns:
+            frequent = self.frequent_values_[col]
+            Xs[col] = np.where(
+                Xs[col].isin(frequent),
+                Xs[col],
+                self.RARE_LABEL,
+            )
+
+        return Xs
+
+    # ------------------------------------------------------------------
+    # Delegate correctly to base class (OOF preserved)
+    # ------------------------------------------------------------------
+    def _fit(self, X: pd.DataFrame, y, **kwargs):
+        return super()._fit(self._preprocess_fit(X), y, **kwargs)
+
+    def _fit_transform(self, X: pd.DataFrame, y, **kwargs):
+        # IMPORTANT: use parent _fit_transform so OOF train_encoded_ is returned
+        return super()._fit_transform(self._preprocess_fit(X), y, **kwargs)
+
+    def _transform(self, X: pd.DataFrame, **kwargs):
+        return super()._transform(self._preprocess_transform(X))
