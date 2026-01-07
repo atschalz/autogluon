@@ -13,15 +13,17 @@ from .drop_unique import DropUniqueFeatureGenerator
 from .dummy import DummyFeatureGenerator
 from .fillna import FillNaFeatureGenerator
 from .frequency import FrequencyFeatureGenerator
+from .groupby import GroupByFeatureGenerator
 from .identity import IdentityFeatureGenerator
 from .isnan import IsNanFeatureGenerator
 from .label_encoder import LabelEncoderFeatureGenerator
 from .memory_minimize import CategoryMemoryMinimizeFeatureGenerator, NumericMemoryMinimizeFeatureGenerator
+from .neighbor_interaction import NeighborInteractionFeatureGenerator, NeighborStructureFeatureGenerator
 from .one_hot_encoder import OneHotEncoderFeatureGenerator
-from .oof_target_encoder import OOFTargetEncodingFeatureGenerator
+from .oof_target_encoder import OOFTargetEncodingFeatureGenerator, OOFNumericTargetEncodingFeatureGenerator, OOFFrequentNumericTargetEncodingFeatureGenerator
 from .pipeline import PipelineFeatureGenerator
 from .rename import RenameFeatureGenerator
-from .tafc import TargetAwareFeatureCompressionFeatureGenerator
+from .tafc import TargetAwareFeatureCompressionFeatureGenerator, RandomSubsetTAFC
 from .text_ngram import TextNgramFeatureGenerator
 from .text_special import TextSpecialFeatureGenerator
 
@@ -42,10 +44,13 @@ REGISTERED_FE_CLS_LST = [
     DummyFeatureGenerator,
     FillNaFeatureGenerator,
     FrequencyFeatureGenerator,
+    GroupByFeatureGenerator,
     IdentityFeatureGenerator,
     IsNanFeatureGenerator,
     LabelEncoderFeatureGenerator,
     CategoryMemoryMinimizeFeatureGenerator,
+    NeighborInteractionFeatureGenerator, 
+    NeighborStructureFeatureGenerator,
     NumericMemoryMinimizeFeatureGenerator,
     OneHotEncoderFeatureGenerator,
     OOFTargetEncodingFeatureGenerator,
