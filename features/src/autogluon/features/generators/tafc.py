@@ -6,6 +6,7 @@ from itertools import combinations
 
 
 from .abstract import AbstractFeatureGenerator
+from typing import Literal
 
 from autogluon.common.features.types import (
     R_BOOL,
@@ -282,26 +283,31 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
 
     def __init__(
         self,
+        target_type: Literal["binary", "multiclass", "regression"],  # "binary", "multiclass", "regression"
         base_tafc_params=None,
         subset_tafc_params=None,
-        n_subsets=10,          # total TAFCs INCLUDING full set
-        subset_size=None,
+        n_subsets=50,          # total TAFCs INCLUDING full set
+        subset_size=5,
         min_subset_size=2,
         max_subset_size=None,
         random_state=42,
-        use_meta_features=True,
-        drop_raw_rstaf=True,
+        use_meta_features=False,
+        drop_raw_rstaf=False,
         **kwargs,
     ):
-
         super().__init__(**kwargs)
         self.base_tafc_params = base_tafc_params or {}
         self.subset_tafc_params = subset_tafc_params or {}
+        if 'target_type' not in self.base_tafc_params:
+            self.base_tafc_params['target_type'] = target_type
+        if 'target_type' not in self.subset_tafc_params:
+            self.subset_tafc_params['target_type'] = target_type
         self.n_subsets = int(n_subsets)
         self.subset_size = subset_size
         self.min_subset_size = int(min_subset_size)
         self.max_subset_size = max_subset_size
         self.random_state = int(random_state)
+        self.target_type = target_type
 
         self.subsets_ = None
         self.tafcs_ = None
@@ -349,7 +355,6 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
 
         return all_subsets
 
-
     def _sample_subset(self, features, rng):
         if self.subset_size is not None:
             k = self.subset_size
@@ -358,6 +363,67 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             k = rng.integers(self.min_subset_size, k_max + 1)
 
         return tuple(sorted(rng.choice(features, size=k, replace=False)))
+    
+    def _sample_unique_subsets(
+        self,
+        features,
+        rng,
+        n: int,
+        subset_size=None,
+        min_k: int = 2,
+        max_k=None,
+        max_tries_multiplier: int = 50,
+    ):
+        """
+        Sample up to n unique feature-subsets without enumerating all combinations.
+        Returns a list[tuple[str]] of sorted feature names.
+
+        - If subset_size is set: fixed-size subsets.
+        - Else: random size in [min_k, max_k] each draw.
+        """
+        features = np.asarray(features)
+        p = len(features)
+        if p <= 1 or n <= 0:
+            return []
+
+        if max_k is None:
+            max_k = p - 1
+        max_k = min(max_k, p - 1)
+        min_k = max(min_k, 1)
+
+        if subset_size is not None:
+            k_min = k_max = int(subset_size)
+            if not (1 <= k_min <= p - 1):
+                return []
+        else:
+            k_min, k_max = min_k, max_k
+            if k_min > k_max:
+                return []
+
+        selected = []
+        seen = set()
+
+        # Prevent infinite loops when the space is small or constraints tight.
+        max_tries = max_tries_multiplier * n
+
+        tries = 0
+        while len(selected) < n and tries < max_tries:
+            tries += 1
+
+            if subset_size is not None:
+                k = k_min
+            else:
+                k = int(rng.integers(k_min, k_max + 1))
+
+            subset = tuple(sorted(rng.choice(features, size=k, replace=False).tolist()))
+            if subset in seen:
+                continue
+
+            seen.add(subset)
+            selected.append(subset)
+
+        return selected
+
 
     def _extract_class_labels(self, df):
         """
@@ -420,14 +486,24 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         else:
             n_random = self.n_subsets - 1
 
-        all_subsets = self._all_valid_subsets(features)
+        selected_subsets = self._sample_unique_subsets(
+            features=features,
+            rng=rng,
+            n=n_random,
+            subset_size=self.subset_size,
+            min_k=self.min_subset_size,
+            max_k=self.max_subset_size,
+        )
 
-        if len(all_subsets) == 0:
-            # No valid subsets possible (e.g. single feature)
-            selected_subsets = []
-        else:
-            rng.shuffle(all_subsets)
-            selected_subsets = all_subsets[: min(n_random, len(all_subsets))]
+
+        # all_subsets = self._all_valid_subsets(features)
+
+        # if len(all_subsets) == 0:
+        #     # No valid subsets possible (e.g. single feature)
+        #     selected_subsets = []
+        # else:
+        #     rng.shuffle(all_subsets)
+        #     selected_subsets = all_subsets[: min(n_random, len(all_subsets))]
 
         new_cols = {}
         for i, subset in enumerate(selected_subsets):
