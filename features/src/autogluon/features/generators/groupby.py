@@ -3,6 +3,10 @@ import pandas as pd
 
 from .abstract import AbstractFeatureGenerator
 
+
+# ----------------------------
+# Aggregations
+# ----------------------------
 def q25(series): return series.quantile(0.25)
 def q75(series): return series.quantile(0.75)
 def q10(series): return series.quantile(0.10)
@@ -23,14 +27,12 @@ AGGREGATION_REGISTRY = {
     "pct_rank": {"kind": "rowwise"},
 }
 
-import numpy as np
-import pandas as pd
 
 def rank_categoricals_by_small_counts(
     X: pd.DataFrame,
     categorical_cols,
     min_count: int = 1,
-    top_k_smallest: int = 10,   # how many tie-breakers to use
+    top_k_smallest: int = 10,
     require_at_least_levels: int = 2,
     observed: bool = True,
 ):
@@ -49,7 +51,6 @@ def rank_categoricals_by_small_counts(
         counts = counts[counts >= min_count].sort_values()  # ascending
 
         if len(counts) < require_at_least_levels:
-            # can't form meaningful group stats; rank it last
             v = np.full(top_k_smallest, -np.inf, dtype=float)
         else:
             v = counts.to_numpy(dtype=float)[:top_k_smallest]
@@ -58,18 +59,18 @@ def rank_categoricals_by_small_counts(
 
         scores[cat] = v
 
-    # Sort by lexicographic DESC on v: maximize min, then 2nd min, ...
     ranked = sorted(scores.keys(), key=lambda c: tuple(scores[c]), reverse=True)
     return ranked, scores
 
 
 class GroupByFeatureGenerator(AbstractFeatureGenerator):
     """
-    Groupby interaction features with flexible relative statistics.
-
-    - Group stats are learned at fit time and reused at transform time.
-    - pct_rank (if requested) is computed vs. the TRAINING distribution per group
-      to avoid depending on other rows in the transformed dataset.
+    Output-identical, faster transform:
+      - Preallocates output 2D array + builds DataFrame once
+      - Caches numeric arrays once
+      - Keeps EXACT category-to-code mapping semantics (Index.get_indexer on raw arrays)
+      - Keeps EXACT feature insertion order as the original dict-based transform
+      - Keeps pct_rank semantics identical (pct_rank is output whenever requested, even if drop_basic=True)
     """
 
     def __init__(
@@ -95,7 +96,7 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         self.max_features = max_features
         self.random_state = random_state
 
-        self.drop_basic_groupby_when_relative = drop_basic_groupby_when_relative  # <-- NEW
+        self.drop_basic_groupby_when_relative = drop_basic_groupby_when_relative
 
         self.fill_value = np.nan if fill_value == "nan" else fill_value
         self.eps = eps
@@ -128,12 +129,13 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         return ("diff" in self.relative_ops) or ("ratio" in self.relative_ops)
 
     def _drop_basic(self) -> bool:
-        # Only drop when explicitly requested AND we are actually producing relative features
+        # Same logic as your original
         return bool(self.drop_basic_groupby_when_relative and self._relative_enabled() and self.relative_to_aggs)
 
     def _features_per_pair(self):
         """
-        How many OUTPUT features per (cat, num) pair, for budgeting.
+        IMPORTANT: kept identical to your original implementation for pair selection / budgeting.
+        (Yes, this means pct_rank is NOT counted when drop_basic=True, matching your current behavior.)
         """
         group_aggs, rowwise_aggs = self._split_aggs()
 
@@ -147,7 +149,6 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
             rel += len(self.relative_to_aggs) * (
                 int("diff" in self.relative_ops) + int("ratio" in self.relative_ops)
             )
-
         return int(base + rel)
 
     # ----------------------------
@@ -168,24 +169,38 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
 
         if len(self.categorical_features) == 0 or len(self.numeric_features) == 0:
             self.group_stats_ = {}
-            self.pct_rank_values_ = {}
+            self.group_index_ = {}
+            self.group_values_ = {}
+            self.pct_rank_keys_ = {}
+            self.pct_rank_vals_ = {}
+            self.pct_rank_by_code_ = {}
+            self.global_stats_ = {}
+            self.output_columns_ = []
+            self.pairs_ = []
             return self
 
         group_aggs, rowwise_aggs = self._split_aggs()
+        drop_basic = self._drop_basic()
 
         ranked_cats, _ = rank_categoricals_by_small_counts(
             X,
             categorical_cols=self.categorical_features,
-            min_count=20,          # pick what "stable" means for you
-            top_k_smallest=10,     # tie-break depth
+            min_count=20,
+            top_k_smallest=10,
         )
-
-        # keep your numeric ordering separate (no need to use nunique order at all)
         ranked_nums = X[self.numeric_features].nunique().sort_values(ascending=False).index.to_list()
 
         self.group_stats_ = {}
-        self.pct_rank_values_ = {}
+        self.group_index_ = {}
+        self.group_values_ = {}
+        self.pct_rank_keys_ = {}
+        self.pct_rank_vals_ = {}
+        self.pct_rank_by_code_ = {}  # keep same lazy cache behavior, but initialize dict
         self.global_stats_ = {num: float(X[num].mean()) for num in self.numeric_features}
+
+        # NEW: store exact transform iteration order + exact output column order
+        self.pairs_ = []
+        self.output_columns_ = []
 
         features_per_pair = self._features_per_pair()
         budget = self.max_features if self.max_features is not None else float("inf")
@@ -202,8 +217,7 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
                 if used_features + features_per_pair > budget:
                     return self
 
-                # group-level stats (still needed even if we won't output them,
-                # because relative features reference them)
+                # group-level stats
                 if group_aggs:
                     named_aggs = {
                         name: pd.NamedAgg(column=num, aggfunc=AGGREGATION_REGISTRY[name]["agg"])
@@ -219,14 +233,41 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
 
                 self.group_stats_[(cat, num)] = stats
 
-                # pct_rank training distribution (per group) (only necessary if requested,
-                # but harmless to keep as-is)
+                idx = stats.index
+                self.group_index_[(cat, num)] = idx
+                self.group_values_[(cat, num)] = {
+                    agg: stats[agg].to_numpy(dtype=float, copy=False)
+                    for agg in stats.columns
+                }
+
                 if "pct_rank" in rowwise_aggs:
                     g = X[[cat, num]].dropna()
-                    sorted_per_group = g.groupby(cat, observed=True)[num].apply(
-                        lambda s: np.sort(s.to_numpy(dtype=float, copy=False))
+                    s = g.groupby(cat, observed=True)[num].apply(
+                        lambda t: np.sort(t.to_numpy(dtype=float, copy=False))
                     )
-                    self.pct_rank_values_[(cat, num)] = sorted_per_group
+                    self.pct_rank_keys_[(cat, num)] = s.index.to_numpy()
+                    self.pct_rank_vals_[(cat, num)] = s.to_numpy()  # dtype=object
+
+                # record order (matches original dict insertion order)
+                self.pairs_.append((cat, num))
+
+                # EXACT output layout:
+                # - group aggs only when not drop_basic
+                if not drop_basic:
+                    for agg in group_aggs:
+                        self.output_columns_.append(f"{num}__by__{cat}__{agg}")
+
+                # - pct_rank ALWAYS when requested (matches your original transform)
+                if "pct_rank" in rowwise_aggs:
+                    self.output_columns_.append(f"{num}__by__{cat}__pct_rank")
+
+                # - relatives in the same nested loop order as original
+                if self._relative_enabled():
+                    for agg in self.relative_to_aggs:
+                        if "diff" in self.relative_ops:
+                            self.output_columns_.append(f"{num}__minus__{cat}_{agg}")
+                        if "ratio" in self.relative_ops:
+                            self.output_columns_.append(f"{num}__ratio__{cat}_{agg}")
 
                 used_features += features_per_pair
 
@@ -236,78 +277,158 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
     # TRANSFORM
     # ----------------------------
     def _transform(self, X):
-        if len(getattr(self, "categorical_features", [])) == 0 or len(getattr(self, "numeric_features", [])) == 0:
-            return X
-
         X = self._to_dataframe(X)
-        features = []
+
+        if len(getattr(self, "pairs_", [])) == 0:
+            empty = pd.DataFrame(index=X.index)
+            return empty if self.return_dataframe else empty.values
 
         group_aggs, rowwise_aggs = self._split_aggs()
         drop_basic = self._drop_basic()
+        rel_enabled = self._relative_enabled()
 
-        for (cat, num), stats in self.group_stats_.items():
-            x = X[num].astype(float)
+        n = len(X)
+        m = len(self.output_columns_)
+        out = np.empty((n, m), dtype=float)
+        col_i = 0
 
-            # map precomputed group stats (always computed to support relatives)
+        # cache numeric arrays once
+        used_nums = {num for _, num in self.pairs_}
+        num_cache = {num: X[num].astype(float).to_numpy(copy=False) for num in used_nums}
+
+        # cache category codes once per cat (EXACT original semantics)
+        codes_cache = {}     # cat -> np.ndarray[int]
+        missing_cache = {}   # cat -> np.ndarray[bool]
+        safe_cache = {}      # cat -> np.ndarray[int] with -1 replaced by 0 for take()
+
+        for (cat, num) in self.pairs_:
+            x = num_cache[num]
+
+            idx = self.group_index_.get((cat, num), None)
+            vals_dict = self.group_values_.get((cat, num), None)
+
             mapped = {}
-            for agg in stats.columns:
-                mapped[agg] = X[cat].map(stats[agg]).astype(float)
 
-                # Only OUTPUT the basic groupby features if not dropping
-                if not drop_basic:
-                    features.append(
-                        mapped[agg].fillna(self.fill_value).rename(f"{num}__by__{cat}__{agg}")
+            # compute codes once per cat, using the FIRST idx encountered for that cat
+            if cat not in codes_cache:
+                if idx is None:
+                    codes = np.full(n, -1, dtype=int)
+                else:
+                    cat_arr = X[cat].to_numpy()
+                    codes = idx.get_indexer(cat_arr)  # exact same as your original
+                codes_cache[cat] = codes
+                missing = (codes == -1)
+                missing_cache[cat] = missing
+
+                safe_codes = codes.copy()
+                safe_codes[missing] = 0
+                safe_cache[cat] = safe_codes
+
+            codes = codes_cache[cat]
+            missing = missing_cache[cat]
+            safe_codes = safe_cache[cat]
+
+            # ---- group aggs mapping ----
+            if idx is not None and vals_dict is not None and len(vals_dict) > 0:
+                for agg, vals in vals_dict.items():
+                    col = vals.take(safe_codes).astype(float, copy=False)
+                    if missing.any():
+                        col = col.copy()
+                        col[missing] = np.nan
+
+                    mapped[agg] = col
+
+                    if not drop_basic:
+                        if self.fill_value is np.nan:
+                            out[:, col_i] = col
+                        else:
+                            out[:, col_i] = np.where(np.isnan(col), self.fill_value, col)
+                        col_i += 1
+            else:
+                # fallback identical to your original
+                stats = self.group_stats_.get((cat, num), None)
+                if stats is not None and len(stats.columns) > 0:
+                    cat_series = X[cat]
+                    for agg in stats.columns:
+                        col = cat_series.map(stats[agg]).astype(float).to_numpy(copy=False)
+                        mapped[agg] = col
+                        if not drop_basic:
+                            if self.fill_value is np.nan:
+                                out[:, col_i] = col
+                            else:
+                                out[:, col_i] = np.where(np.isnan(col), self.fill_value, col)
+                            col_i += 1
+
+            # ---- pct_rank: ALWAYS output when requested (matches your original) ----
+            if "pct_rank" in rowwise_aggs:
+                pr = np.full(n, 0.5, dtype=float)
+                vals = x
+
+                valid = (codes != -1) & (~np.isnan(vals))
+                if valid.any():
+                    keys = self.pct_rank_keys_.get((cat, num), None)
+                    dists = self.pct_rank_vals_.get((cat, num), None)
+
+                    if idx is not None and keys is not None and dists is not None and len(keys) > 0:
+                        dist_by_code = self.pct_rank_by_code_.get((cat, num), None)
+                        if dist_by_code is None:
+                            dist_by_code = np.empty(len(idx), dtype=object)
+                            dist_by_code[:] = None
+                            pos = idx.get_indexer(keys)
+                            ok = pos != -1
+                            dist_by_code[pos[ok]] = dists[ok]
+                            self.pct_rank_by_code_[(cat, num)] = dist_by_code
+
+                        vidx = np.flatnonzero(valid)
+                        vcode = codes[vidx]
+                        order = np.argsort(vcode, kind="mergesort")
+                        vidx = vidx[order]
+                        vcode = vcode[order]
+
+                        breaks = np.r_[0, 1 + np.flatnonzero(vcode[1:] != vcode[:-1]), vcode.size]
+                        for b0, b1 in zip(breaks[:-1], breaks[1:]):
+                            c = vcode[b0]
+                            arr = dist_by_code[c]
+                            if arr is None or arr.size == 0:
+                                continue
+                            rows = vidx[b0:b1]
+                            ranks = np.searchsorted(arr, vals[rows], side="right")
+                            pr[rows] = ranks / arr.size
+
+                out[:, col_i] = pr
+                col_i += 1
+
+            # ---- relatives ----
+            if rel_enabled:
+                missing_aggs = set(self.relative_to_aggs) - set(mapped)
+                if missing_aggs:
+                    raise ValueError(
+                        f"Requested relative_to_aggs {missing_aggs} not present in computed "
+                        f"group aggregations {list(mapped)} for pair ({cat}, {num}). "
+                        f"Make sure those aggs are included in `aggregations=`."
                     )
 
-            # pct_rank output only if requested AND not dropping basics
-            if ("pct_rank" in rowwise_aggs):
-                pct_feat = pd.Series(index=X.index, dtype=float)
-
-                dist = self.pct_rank_values_.get((cat, num), None)
-                if dist is None or len(dist) == 0:
-                    pct_feat[:] = 0.5
-                else:
-                    cats = X[cat]
-                    vals = x.to_numpy()
-
-                    out = np.full(len(X), 0.5, dtype=float)
-                    for i, (c, v) in enumerate(zip(cats.to_numpy(), vals)):
-                        if pd.isna(c) or pd.isna(v):
-                            continue
-                        arr = dist.get(c, None)
-                        if arr is None or arr.size == 0:
-                            continue
-                        rank = np.searchsorted(arr, v, side="right")
-                        out[i] = rank / arr.size
-                    pct_feat[:] = out
-
-                features.append(pct_feat.rename(f"{num}__by__{cat}__pct_rank"))
-
-            # validate relative aggs exist among computed group stats
-            missing = set(self.relative_to_aggs) - set(mapped)
-            if missing:
-                raise ValueError(
-                    f"Requested relative_to_aggs {missing} not present in computed "
-                    f"group aggregations {list(mapped)} for pair ({cat}, {num}). "
-                    f"Make sure those aggs are included in `aggregations=`."
-                )
-
-            # relative features
-            if self._relative_enabled():
                 for agg in self.relative_to_aggs:
                     ref = mapped[agg]
                     if "diff" in self.relative_ops:
-                        features.append((x - ref).rename(f"{num}__minus__{cat}_{agg}"))
+                        out[:, col_i] = (x - ref)
+                        col_i += 1
                     if "ratio" in self.relative_ops:
-                        features.append((x / (ref + self.eps)).rename(f"{num}__ratio__{cat}_{agg}"))
+                        out[:, col_i] = (x / (ref + self.eps))
+                        col_i += 1
 
-        result = pd.concat(features, axis=1)
+        if col_i != m:
+            raise RuntimeError(
+                f"Internal error: wrote {col_i} columns but expected {m}. "
+                f"This indicates a mismatch between output_columns_ and transform writing order."
+            )
+
+        result = pd.DataFrame(out, columns=self.output_columns_, index=X.index)
         return result if self.return_dataframe else result.values
 
     def _fit_transform(self, X, y):
         self._fit(X, y)
         return self._transform(X), dict()
-
 
     @staticmethod
     def get_default_infer_features_in_args() -> dict:
