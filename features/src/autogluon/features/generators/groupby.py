@@ -23,6 +23,46 @@ AGGREGATION_REGISTRY = {
     "pct_rank": {"kind": "rowwise"},
 }
 
+import numpy as np
+import pandas as pd
+
+def rank_categoricals_by_small_counts(
+    X: pd.DataFrame,
+    categorical_cols,
+    min_count: int = 1,
+    top_k_smallest: int = 10,   # how many tie-breakers to use
+    require_at_least_levels: int = 2,
+    observed: bool = True,
+):
+    """
+    Returns categorical_cols sorted best->worst by lexicographic comparison of the
+    smallest group sizes (min, 2nd-min, ...).
+
+    Score vector per cat:
+      v = sorted(counts[counts >= min_count])[:top_k_smallest]
+    Pad with +inf to fixed length so fewer levels doesn't get penalized.
+    Sort by v descending lexicographically.
+    """
+    scores = {}
+    for cat in categorical_cols:
+        counts = X[cat].value_counts(dropna=True)
+        counts = counts[counts >= min_count].sort_values()  # ascending
+
+        if len(counts) < require_at_least_levels:
+            # can't form meaningful group stats; rank it last
+            v = np.full(top_k_smallest, -np.inf, dtype=float)
+        else:
+            v = counts.to_numpy(dtype=float)[:top_k_smallest]
+            if v.size < top_k_smallest:
+                v = np.pad(v, (0, top_k_smallest - v.size), constant_values=np.inf)
+
+        scores[cat] = v
+
+    # Sort by lexicographic DESC on v: maximize min, then 2nd min, ...
+    ranked = sorted(scores.keys(), key=lambda c: tuple(scores[c]), reverse=True)
+    return ranked, scores
+
+
 class GroupByFeatureGenerator(AbstractFeatureGenerator):
     """
     Groupby interaction features with flexible relative statistics.
@@ -43,7 +83,7 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         eps=1e-8,
         return_dataframe=True,
         add_low_cardinality=None,
-        max_features=None,
+        max_features=500,
         random_state=42,
         **kwargs,
     ):
@@ -133,12 +173,15 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
 
         group_aggs, rowwise_aggs = self._split_aggs()
 
-        ranked_cols = (
-            X.nunique(dropna=True)
-             .sort_values(ascending=False)
-             .index
-             .tolist()
+        ranked_cats, _ = rank_categoricals_by_small_counts(
+            X,
+            categorical_cols=self.categorical_features,
+            min_count=20,          # pick what "stable" means for you
+            top_k_smallest=10,     # tie-break depth
         )
+
+        # keep your numeric ordering separate (no need to use nunique order at all)
+        ranked_nums = X[self.numeric_features].nunique().sort_values(ascending=False).index.to_list()
 
         self.group_stats_ = {}
         self.pct_rank_values_ = {}
@@ -148,11 +191,11 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         budget = self.max_features if self.max_features is not None else float("inf")
         used_features = 0
 
-        for cat in ranked_cols:
+        for cat in ranked_cats:
             if cat not in self.categorical_features:
                 continue
 
-            for num in ranked_cols:
+            for num in ranked_nums:
                 if num not in self.numeric_features:
                     continue
 
