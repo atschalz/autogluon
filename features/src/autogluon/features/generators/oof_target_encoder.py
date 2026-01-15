@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
-
+from sklearn.metrics import roc_auc_score
 from autogluon.common.utils.cv_splitter import CVSplitter
 
 from .abstract import AbstractFeatureGenerator
@@ -47,6 +47,7 @@ class OOFTargetEncodingFeatureGenerator(AbstractFeatureGenerator):
         alpha: float = 10.0,
         # TODO: Consider adding max_classes to select only the most frequent classes for multi-class to avoid feature explosion for many-class problems
         random_state: int = 42,
+        auc_threshold: float = None, # TODO: Not integrated in _fit and _transform yet
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -58,6 +59,7 @@ class OOFTargetEncodingFeatureGenerator(AbstractFeatureGenerator):
         self.n_splits = n_splits
         self.alpha = alpha
         self.random_state = random_state
+        self.auc_threshold = auc_threshold
 
     def estimate_new_dtypes(self, n_numeric, n_categorical, n_binary, num_classes=None, **kwargs) -> int:
         num_new_feats = n_categorical
@@ -76,6 +78,11 @@ class OOFTargetEncodingFeatureGenerator(AbstractFeatureGenerator):
             return num_classes * num_cat_cols, X_cat.columns.tolist()
         else:
             return num_cat_cols, X_cat.columns.tolist()
+
+    def _filter_by_auc(self, X: pd.DataFrame, y: pd.Series, auc_threshold: float = 0.51) -> pd.DataFrame:
+        target_corr_mic = pd.concat([X[[i for i in X.columns if "__te" in i and f'class{c}' in i]].apply(lambda x: roc_auc_score(y==c,x)).apply(lambda x: np.max([x,1-x])) for c in range(y.nunique())])
+        drop_cols = target_corr_mic.index[target_corr_mic<0.51]
+        return X.drop(columns=drop_cols,axis=1)
 
     def _fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
         original_index = X.index
