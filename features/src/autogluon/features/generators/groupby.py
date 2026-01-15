@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from .abstract import AbstractFeatureGenerator
-
+from autogluon.common.features.types import R_CATEGORY, R_OBJECT
 
 # ----------------------------
 # Aggregations
@@ -83,7 +83,8 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         fill_value="nan",
         eps=1e-8,
         return_dataframe=True,
-        add_low_cardinality=None,
+        num_as_cat_cardinality_thresh=2,
+        min_num_cardinality_thresh=10,
         max_features=500,
         random_state=42,
         **kwargs,
@@ -102,7 +103,8 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         self.eps = eps
         self.return_dataframe = return_dataframe
 
-        self.max_cardinality = add_low_cardinality if add_low_cardinality is not None else 2
+        self.num_as_cat_cardinality_thresh = num_as_cat_cardinality_thresh
+        self.min_num_cardinality_thresh = min_num_cardinality_thresh
 
         unknown = set(self.aggregations) - set(AGGREGATION_REGISTRY)
         if unknown:
@@ -158,13 +160,13 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
         X = self._to_dataframe(X)
 
         # infer types
-        self.categorical_features = X.columns[X.nunique() < self.max_cardinality].tolist()
-        self.categorical_features += X.select_dtypes(include="category").columns.tolist()
+        self.categorical_features = X.columns[X.nunique() < self.num_as_cat_cardinality_thresh].tolist()
+        self.categorical_features += X.select_dtypes(include=[R_CATEGORY, R_OBJECT]).columns.tolist()
         self.categorical_features = np.unique(self.categorical_features).tolist()
 
         self.numeric_features = [
             col for col in X.columns
-            if col not in self.categorical_features and X[col].dtype not in ["category", "object"]
+            if col not in self.categorical_features and X[col].dtype not in ["category", "object"] and X[col].nunique() >= self.min_num_cardinality_thresh
         ]
 
         if len(self.categorical_features) == 0 or len(self.numeric_features) == 0:
@@ -265,9 +267,9 @@ class GroupByFeatureGenerator(AbstractFeatureGenerator):
                 if self._relative_enabled():
                     for agg in self.relative_to_aggs:
                         if "diff" in self.relative_ops:
-                            self.output_columns_.append(f"{num}__minus__{cat}_{agg}")
+                            self.output_columns_.append(f"{num}__minus__by__{cat}_{agg}")
                         if "ratio" in self.relative_ops:
-                            self.output_columns_.append(f"{num}__ratio__{cat}_{agg}")
+                            self.output_columns_.append(f"{num}__ratio__by__{cat}_{agg}")
 
                 used_features += features_per_pair
 
