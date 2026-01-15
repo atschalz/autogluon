@@ -45,6 +45,7 @@ class NeighborInteractionFeatureGenerator(AbstractFeatureGenerator):
         self.shrinkage_m = shrinkage_m
         self.include_distance = include_distance
         self.random_state = random_state
+        self.na_means = {}
 
     def _geometry_quality(self, Z, y):
         rng = np.random.RandomState(self.random_state)
@@ -132,6 +133,10 @@ class NeighborInteractionFeatureGenerator(AbstractFeatureGenerator):
 
         # final processed matrix
         X_proc = pd.concat([X_bin, X_num, X_cat], axis=1)
+        for col in X_proc.columns:
+            self.na_means[col] = X_proc[col].mean()
+            if X_proc[col].isna().any():
+                X_proc[col] = X_proc[col].fillna(self.na_means[col])
         self.proc_columns_ = X_proc.columns.tolist()
         X_np = X_proc.values
 
@@ -242,6 +247,9 @@ class NeighborInteractionFeatureGenerator(AbstractFeatureGenerator):
         X_bin = X[self.binary_cols_] if self.binary_cols_ else pd.DataFrame(index=X.index)
 
         X_proc = pd.concat([X_bin, X_num, X_cat], axis=1)
+        for col in X_proc.columns:
+            if X_proc[col].isna().any():
+                X_proc[col] = X_proc[col].fillna(self.na_means[col])
 
         if self.use_svd:
             Z = self.svd_.transform(X_proc.values)
@@ -362,6 +370,7 @@ class NeighborStructureFeatureGenerator(AbstractFeatureGenerator):
 
     def __init__(
         self,
+        target_type='regression',
         use_svd=True,
         svd_variance_target=0.90,
         svd_max_components=256,
