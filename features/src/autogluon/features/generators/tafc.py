@@ -1,7 +1,5 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold, KFold
-from sklearn.preprocessing import LabelEncoder
 from itertools import combinations
 
 
@@ -9,17 +7,6 @@ from .abstract import AbstractFeatureGenerator
 from .oof_target_encoder import OOFTargetEncodingFeatureGenerator
 from typing import Literal
 
-from autogluon.common.features.types import (
-    R_BOOL,
-    R_CATEGORY,
-    R_FLOAT,
-    R_INT,
-    R_OBJECT,
-    S_BOOL,
-    S_DATETIME_AS_OBJECT,
-    S_IMAGE_BYTEARRAY,
-    S_IMAGE_PATH,
-)
 
 class TargetAwareFeatureCompressionFeatureGenerator(AbstractFeatureGenerator):
     """
@@ -32,8 +19,8 @@ class TargetAwareFeatureCompressionFeatureGenerator(AbstractFeatureGenerator):
         alpha=0,
         only_cat=False,
         max_cardinality=None,
-        round_numerical: int = 2,   # <-- NEW
-        return_oof: bool = True,   # <-- NEW        
+        round_numerical: int = 2,   
+        multi_class_as_regression: bool = False,
         random_state=42,
         **kwargs,
     ):
@@ -47,61 +34,71 @@ class TargetAwareFeatureCompressionFeatureGenerator(AbstractFeatureGenerator):
         self.max_cardinality = (
             int(max_cardinality) if max_cardinality is not None else None
         )
-        self.round_numerical = int(round_numerical)  # <-- NEW
+        self.round_numerical = int(round_numerical)  
+        self.multi_class_as_reg = multi_class_as_regression
 
-        self.return_oof = return_oof
+        self.tafc_useless = False
 
 
     def _make_key(self, X: pd.DataFrame) -> pd.Series:
-        cols = X.columns
-
-        # filter by categorical dtype if requested
+        # pick columns
         if self.only_cat:
             cols = X.select_dtypes(include=["object", "category"]).columns
+        else:
+            cols = X.columns
 
-        # filter by cardinality if requested
         if self.max_cardinality is not None and len(cols) > 0:
             nunique = X[cols].nunique(dropna=False)
             cols = nunique[nunique < self.max_cardinality].index
 
-        # fallback: avoid empty key
         if len(cols) == 0:
             cols = X.columns
 
-        X_key = X[cols].copy()
+        X_key = X.loc[:, cols]
 
-        # --- NEW: round numerical columns ---
+        # round numeric cols without copying entire frame
         num_cols = X_key.select_dtypes(include=["float", "int"]).columns
         if len(num_cols) > 0:
-            X_key[num_cols] = X_key[num_cols].round(self.round_numerical)
+            X_key = X_key.copy()
+            X_key.loc[:, num_cols] = X_key.loc[:, num_cols].round(self.round_numerical)
 
-        return X_key.astype(str).agg("|".join, axis=1)
+        # hash each row -> deterministic uint64, then cast to string (OOF TE expects a single col)
+        key = pd.util.hash_pandas_object(X_key, index=False).astype("uint64").astype(str)
+        return key
 
     def _fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-        self.oof_te = OOFTargetEncodingFeatureGenerator(target_type=self.target_type,random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
         key = self._make_key(X)
+        if key.nunique()==X.shape[0]:
+            self.tafc_useless = True
+            out = pd.DataFrame(index=X.index)
+            return out, dict()
 
+        self.oof_te = OOFTargetEncodingFeatureGenerator(target_type=self.target_type,random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
+
+        out = pd.DataFrame(index=X.index)
         if self.target_type == "multiclass":
             self.n_classes_ = len(np.unique(y))
-            self.oof_te_multi_as_reg = OOFTargetEncodingFeatureGenerator(target_type="regression", random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
-            out = self.oof_te_multi_as_reg.fit_transform(key.to_frame(), y)
-            out.columns = ['TAFC_score']
+            if self.multi_class_as_reg:
+                self.oof_te_multi_as_reg = OOFTargetEncodingFeatureGenerator(target_type="regression", random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
+                out['TAFC_score'] = self.oof_te_multi_as_reg.fit_transform(key.to_frame(), y)
             out[[f"TAFC_score_class_{i}" for i in range(self.n_classes_)]] = self.oof_te.fit_transform(key.to_frame(), y)
         else:
-            out = self.oof_te.fit_transform(key.to_frame(), y)    
-            out.columns = ['TAFC_score']
+            out['TAFC_score'] = self.oof_te.fit_transform(key.to_frame(), y)    
         
         return out, dict()
 
     def _transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if self.tafc_useless:
+            out = pd.DataFrame(index=X.index)
+            return out
         key = self._make_key(X)
+        out = pd.DataFrame(index=X.index)
         if self.target_type == "multiclass":
-            out = self.oof_te_multi_as_reg.transform(key.to_frame())
-            out.columns = ['TAFC_score']
+            if self.multi_class_as_reg:
+                out['TAFC_score']  = self.oof_te_multi_as_reg.transform(key.to_frame())
             out[[f"TAFC_score_class_{i}" for i in range(self.n_classes_)]] = self.oof_te.transform(key.to_frame())
         else:
-            out = self.oof_te.transform(key.to_frame())
-            out.columns = ['TAFC_score']
+            out['TAFC_score'] = self.oof_te.transform(key.to_frame())
     
         return out
 
@@ -130,6 +127,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         target_type: Literal["binary", "multiclass", "regression"],  # "binary", "multiclass", "regression"
         base_tafc_params=None,
         subset_tafc_params=None,
+        multiclass_as_regression: bool = False,
         n_subsets=50,          # 50
         subset_size=None, # 5
         min_subset_size=2, # 2
@@ -146,6 +144,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             self.base_tafc_params['target_type'] = target_type
         if 'target_type' not in self.subset_tafc_params:
             self.subset_tafc_params['target_type'] = target_type
+        self.multiclass_as_regression = multiclass_as_regression
         self.n_subsets = int(n_subsets)
         self.subset_size = subset_size
         self.min_subset_size = int(min_subset_size)
@@ -198,15 +197,6 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
                 all_subsets.extend(combinations(features, k))
 
         return all_subsets
-
-    def _sample_subset(self, features, rng):
-        if self.subset_size is not None:
-            k = self.subset_size
-        else:
-            k_max = self.max_subset_size or len(features) - 1
-            k = rng.integers(self.min_subset_size, k_max + 1)
-
-        return tuple(sorted(rng.choice(features, size=k, replace=False)))
     
     def _sample_unique_subsets(
         self,
@@ -302,20 +292,22 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         sdf = tafc_full.fit_transform(X, y).reset_index(drop=True)
 
         # core outputs
-        out["RSTAF_0_score"] = sdf["TAFC_score"].to_numpy()
-        if self.base_tafc_params.get("add_bins", False):
-            out["RSTAF_0_bin"] = sdf["TAFC_bin"].to_numpy()
-        if self.base_tafc_params.get("add_support", False):
-            out["RSTAF_0_support"] = sdf["TAFC_support"].to_numpy()
+        if 'TAFC_score' in sdf.columns:
+            out["RSTAF_0_score"] = sdf["TAFC_score"].to_numpy()
+            if self.base_tafc_params.get("add_bins", False):
+                out["RSTAF_0_bin"] = sdf["TAFC_bin"].to_numpy()
+            if self.base_tafc_params.get("add_support", False):
+                out["RSTAF_0_support"] = sdf["TAFC_support"].to_numpy()
 
         # --- NEW: detect multiclass channels once ---
         if self.base_tafc_params.get("target_type") == "multiclass":
             self.class_labels_ = self._extract_class_labels(sdf)
-            # --- NEW: propagate class-conditional TAFC ---
-            for lbl in self.class_labels_:
-                out[f"RSTAF_0_score_class_{lbl}"] = sdf[
-                    f"TAFC_score_class_{lbl}"
-                ].to_numpy()
+            if sdf.shape[1]>1:
+                # --- NEW: propagate class-conditional TAFC ---
+                for lbl in self.class_labels_:
+                    out[f"RSTAF_0_score_class_{lbl}"] = sdf[
+                        f"TAFC_score_class_{lbl}"
+                    ].to_numpy()
 
         else:
             self.class_labels_ = []
@@ -324,11 +316,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self.tafcs_.append(tafc_full)
 
         # ---- 1..n) Random subsets ----
-        if out["RSTAF_0_score"].nunique() == 1:
-            # Full-feature TAFC is constant -> no point in adding more
-            n_random = 0
-        else:
-            n_random = self.n_subsets - 1
+        n_random = self.n_subsets - 1
 
         selected_subsets = self._sample_unique_subsets(
             features=features,
@@ -352,28 +340,24 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         new_cols = {}
         for i, subset in enumerate(selected_subsets):
             subset = tuple(subset)
-            self.subsets_.append(subset)
 
             tafc = TargetAwareFeatureCompressionFeatureGenerator(**self.subset_tafc_params)
             sdf = tafc.fit_transform(X[list(subset)], y).reset_index(drop=True)
+            if sdf.shape[1]>0:
+                self.subsets_.append(subset)
+                col_idx = i + 1
 
-            col_idx = i + 1
+                if 'TAFC_score' in sdf.columns:
+                    new_cols[f"RSTAF_{col_idx}_score"] = sdf["TAFC_score"].to_numpy()
 
-            new_cols[f"RSTAF_{col_idx}_score"] = sdf["TAFC_score"].to_numpy()
+                if self.base_tafc_params.get("target_type") == "multiclass":
+                    if sdf.shape[1]>1:
+                        for lbl in self.class_labels_:
+                            new_cols[f"RSTAF_{col_idx}_score_class_{lbl}"] = sdf[
+                                f"TAFC_score_class_{lbl}"
+                            ].to_numpy()
 
-            if self.subset_tafc_params.get("add_bins", False):
-                new_cols[f"RSTAF_{col_idx}_bin"] = sdf["TAFC_bin"].to_numpy()
-
-            if self.subset_tafc_params.get("add_support", False):
-                new_cols[f"RSTAF_{col_idx}_support"] = sdf["TAFC_support"].to_numpy()
-
-            if self.base_tafc_params.get("target_type") == "multiclass":
-                for lbl in self.class_labels_:
-                    new_cols[f"RSTAF_{col_idx}_score_class_{lbl}"] = sdf[
-                        f"TAFC_score_class_{lbl}"
-                    ].to_numpy()
-
-            self.tafcs_.append(tafc)
+                self.tafcs_.append(tafc)
 
         out = pd.concat([out, pd.DataFrame(new_cols, index=out.index)], axis=1)
 
@@ -424,15 +408,10 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             else:
                 tafc_params = self.subset_tafc_params
            
-            new_cols[f"RSTAF_{i}_score"] = sdf["TAFC_score"].to_numpy()
+            if 'TAFC_score' in sdf.columns:
+                new_cols[f"RSTAF_{i}_score"] = sdf["TAFC_score"].to_numpy()
 
-            if self.subset_tafc_params.get("add_bins", False):
-                new_cols[f"RSTAF_{i}_bin"] = sdf["TAFC_bin"].to_numpy()
-
-            if self.subset_tafc_params.get("add_support", False):
-                new_cols[f"RSTAF_{i}_support"] = sdf["TAFC_support"].to_numpy()
-
-            if self.base_tafc_params.get("target_type") == "multiclass":
+            if self.base_tafc_params.get("target_type") == "multiclass" and sdf.shape[1]>1:
                 for lbl in self.class_labels_:
                     new_cols[f"RSTAF_{i}_score_class_{lbl}"] = sdf[
                         f"TAFC_score_class_{lbl}"
