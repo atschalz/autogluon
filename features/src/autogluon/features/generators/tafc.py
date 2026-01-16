@@ -132,6 +132,8 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         subset_size=None, # 5
         min_subset_size=2, # 2
         max_subset_size=None,
+        max_base_feats_to_consider=50,  
+        stop_at_tafc_if_empty=True,
         random_state=42,
         use_meta_features=False, # False
         drop_raw_rstaf=False, # False
@@ -151,7 +153,11 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self.max_subset_size = max_subset_size
         self.random_state = int(random_state)
         self.target_type = target_type
-
+        self.max_base_feats_to_consider = (
+            int(max_base_feats_to_consider) if max_base_feats_to_consider is not None else None
+        )
+        self.stop_at_tafc_if_empty = bool(stop_at_tafc_if_empty)
+        self.base_features_ = None
         self.subsets_ = None
         self.tafcs_ = None
         self.class_labels_ = None   # <-- NEW
@@ -197,6 +203,15 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
                 all_subsets.extend(combinations(features, k))
 
         return all_subsets
+
+    def _sample_subset(self, features, rng):
+        if self.subset_size is not None:
+            k = self.subset_size
+        else:
+            k_max = self.max_subset_size or len(features) - 1
+            k = rng.integers(self.min_subset_size, k_max + 1)
+
+        return tuple(sorted(rng.choice(features, size=k, replace=False)))
     
     def _sample_unique_subsets(
         self,
@@ -270,11 +285,44 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
                 labels.append(c.replace("TAFC_score_class_", ""))
         return labels
 
+    def _select_top_mode_features(self, X: pd.DataFrame, k: int):
+        """
+        Pick top-k columns by mode strength:
+          max(value_count(col))/n_rows  (with dropna=False)
+        Returns list[str] in descending order.
+        """
+        if k is None or k <= 0:
+            return list(X.columns)
+
+        k = min(k, X.shape[1])
+        n = len(X)
+        if n == 0:
+            return list(X.columns)[:k]
+
+        scores = {}
+        for c in X.columns:
+            vc = X[c].value_counts(dropna=False)
+            # if all NaN or empty, vc can be empty; guard:
+            top = int(vc.iloc[0]) if len(vc) else 0
+            scores[c] = top / n
+
+        # Highest mode strength first; stable tie-break by column name
+        ordered = sorted(scores.keys(), key=lambda c: (-scores[c], str(c)))
+        return ordered[:k]
+
     def _fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         from tabarena.benchmark.models.prep_ag.prep_lgb.linear_init import CustomLinearModel
         X_index = X.index
         X = X.reset_index(drop=True)
         y = pd.Series(y).reset_index(drop=True)
+
+        # restrict features by highest mode strength ---
+        if self.max_base_feats_to_consider is not None and X.shape[1] > 0:
+            selected = self._select_top_mode_features(X, self.max_base_feats_to_consider)
+            X = X[selected]
+            self.base_features_ = tuple(selected)
+        else:
+            self.base_features_ = tuple(X.columns)
 
         features = np.array(X.columns)
         rng = np.random.default_rng(self.random_state)
@@ -286,18 +334,14 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
 
         # ---- 0) Full-feature TAFC (always) ----
         full_subset = tuple(features.tolist())
-        self.subsets_.append(full_subset)
 
-        tafc_full = TargetAwareFeatureCompressionFeatureGenerator(**self.base_tafc_params)
+        tafc_full = TargetAwareFeatureCompressionFeatureGenerator(**self.base_tafc_params, verbosity=0)
         sdf = tafc_full.fit_transform(X, y).reset_index(drop=True)
 
         # core outputs
         if 'TAFC_score' in sdf.columns:
             out["RSTAF_0_score"] = sdf["TAFC_score"].to_numpy()
-            if self.base_tafc_params.get("add_bins", False):
-                out["RSTAF_0_bin"] = sdf["TAFC_bin"].to_numpy()
-            if self.base_tafc_params.get("add_support", False):
-                out["RSTAF_0_support"] = sdf["TAFC_support"].to_numpy()
+            self.subsets_.append(full_subset)
 
         # --- NEW: detect multiclass channels once ---
         if self.base_tafc_params.get("target_type") == "multiclass":
@@ -309,10 +353,16 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
                         f"TAFC_score_class_{lbl}"
                     ].to_numpy()
 
+                if len(self.subsets_) == 0:
+                    self.subsets_.append(full_subset)
+
         else:
             self.class_labels_ = []
 
-
+        if self.stop_at_tafc_if_empty and len(self.subsets_) == 0:
+            # no useful TAFC could be computed
+            return out, dict()
+    
         self.tafcs_.append(tafc_full)
 
         # ---- 1..n) Random subsets ----
@@ -327,7 +377,6 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             max_k=self.max_subset_size,
         )
 
-
         # all_subsets = self._all_valid_subsets(features)
 
         # if len(all_subsets) == 0:
@@ -338,14 +387,15 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         #     selected_subsets = all_subsets[: min(n_random, len(all_subsets))]
 
         new_cols = {}
+        col_idx = 1
+
         for i, subset in enumerate(selected_subsets):
             subset = tuple(subset)
 
-            tafc = TargetAwareFeatureCompressionFeatureGenerator(**self.subset_tafc_params)
+            tafc = TargetAwareFeatureCompressionFeatureGenerator(**self.subset_tafc_params, verbosity=0)
             sdf = tafc.fit_transform(X[list(subset)], y).reset_index(drop=True)
             if sdf.shape[1]>0:
                 self.subsets_.append(subset)
-                col_idx = i + 1
 
                 if 'TAFC_score' in sdf.columns:
                     new_cols[f"RSTAF_{col_idx}_score"] = sdf["TAFC_score"].to_numpy()
@@ -358,6 +408,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
                             ].to_numpy()
 
                 self.tafcs_.append(tafc)
+                col_idx += 1
 
         out = pd.concat([out, pd.DataFrame(new_cols, index=out.index)], axis=1)
 
