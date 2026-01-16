@@ -6,6 +6,7 @@ from itertools import combinations
 
 
 from .abstract import AbstractFeatureGenerator
+from .oof_target_encoder import OOFTargetEncodingFeatureGenerator
 from typing import Literal
 
 from autogluon.common.features.types import (
@@ -23,47 +24,31 @@ from autogluon.common.features.types import (
 class TargetAwareFeatureCompressionFeatureGenerator(AbstractFeatureGenerator):
     """
     Target-Aware Feature Compression (TAFC)
-
-    Outputs (always):
-      - TAFC_score
-      - TAFC_bin
-      - TAFC_support
-
-    Multiclass only (additional):
-      - TAFC_score_class_<class_label>
     """
-
     def __init__(
         self,
-        n_bins=1000,
+        target_type:str,  # "binary", "multiclass", "regression"
         n_splits=5,
-        smoothing=0,
-        random_state=42,
-        stratify=True,
-        target_type="multiclass",  # "binary", "multiclass", "regression"
+        alpha=0,
         only_cat=False,
         max_cardinality=None,
-        add_bins=False,
-        add_support=False,
         round_numerical: int = 2,   # <-- NEW
         return_oof: bool = True,   # <-- NEW        
+        random_state=42,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.n_bins = int(n_bins)
-        self.n_splits = int(n_splits)
-        self.smoothing = float(smoothing)
-        self.random_state = int(random_state)
-        self.stratify = bool(stratify)
         self.target_type = target_type
+        self.random_state = random_state
+        self.n_splits = n_splits
+        self.alpha = alpha
+
         self.only_cat = bool(only_cat)
         self.max_cardinality = (
             int(max_cardinality) if max_cardinality is not None else None
         )
-        self.add_bins = bool(add_bins)
-        self.add_support = bool(add_support)
-
         self.round_numerical = int(round_numerical)  # <-- NEW
+
         self.return_oof = return_oof
 
 
@@ -92,180 +77,39 @@ class TargetAwareFeatureCompressionFeatureGenerator(AbstractFeatureGenerator):
 
         return X_key.astype(str).agg("|".join, axis=1)
 
-
-
     def _fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-        X_index = X.index
-        X = X.reset_index(drop=True)
-        y = pd.Series(y).reset_index(drop=True)
-
-        # ----- target handling -----
-        if self.target_type == "multiclass":
-            self.label_encoder_ = LabelEncoder()
-            y_enc = self.label_encoder_.fit_transform(y)
-            self.classes_ = self.label_encoder_.classes_
-            y_used = pd.Series(y_enc)
-        else:
-            y_used = y.astype(float)
-
+        self.oof_te = OOFTargetEncodingFeatureGenerator(target_type=self.target_type,random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
         key = self._make_key(X)
-        self.global_mean_ = float(y_used.mean())
-
-        n = len(X)
-        oof_score = np.empty(n, dtype=float)
-        oof_support = np.empty(n, dtype=float)
 
         if self.target_type == "multiclass":
-            K = len(self.classes_)
-            oof_class_scores = np.zeros((n, K), dtype=float)
-            self.global_class_means_ = np.array(
-                [(y_used == k).mean() for k in range(K)]
-            )
-
-        # ----- CV strategy -----
-        if self.stratify and self.target_type != "regression":
-            cv = StratifiedKFold(
-                n_splits=self.n_splits,
-                shuffle=True,
-                random_state=self.random_state,
-            )
-            splits = cv.split(X, y)
+            self.n_classes_ = len(np.unique(y))
+            self.oof_te_multi_as_reg = OOFTargetEncodingFeatureGenerator(target_type="regression", random_state=self.random_state, n_splits=self.n_splits, alpha=self.alpha)
+            out = self.oof_te_multi_as_reg.fit_transform(key.to_frame(), y)
+            out.columns = ['TAFC_score']
+            out[[f"TAFC_score_class_{i}" for i in range(self.n_classes_)]] = self.oof_te.fit_transform(key.to_frame(), y)
         else:
-            cv = KFold(
-                n_splits=self.n_splits,
-                shuffle=True,
-                random_state=self.random_state,
-            )
-            splits = cv.split(X)
-
-        # ----- OOF encoding -----
-        for tr_idx, va_idx in splits:
-            tr_key = key.iloc[tr_idx]
-            tr_y = y_used.iloc[tr_idx]
-
-            stats = tr_y.groupby(tr_key).agg(["mean", "count"])
-            m = self.smoothing
-            stats["smoothed"] = (
-                stats["count"] * stats["mean"] + m * self.global_mean_
-            ) / (stats["count"] + m)
-
-            va_key = key.iloc[va_idx]
-            score = va_key.map(stats["smoothed"])
-            support = va_key.map(stats["count"])
-
-            oof_score[va_idx] = score.fillna(self.global_mean_).to_numpy()
-            oof_support[va_idx] = support.fillna(0).to_numpy()
-
-            # ----- multiclass: class-conditional -----
-            if self.target_type == "multiclass":
-                for k in range(K):
-                    tr_yk = (tr_y == k).astype(float)
-                    stats_k = tr_yk.groupby(tr_key).agg(["mean", "count"])
-                    stats_k["smoothed"] = (
-                        stats_k["count"] * stats_k["mean"]
-                        + m * self.global_class_means_[k]
-                    ) / (stats_k["count"] + m)
-
-                    oof_class_scores[va_idx, k] = (
-                        va_key.map(stats_k["smoothed"])
-                        .fillna(self.global_class_means_[k])
-                        .to_numpy()
-                    )
-
-        # ----- binning -----
-        raw_edges = np.quantile(
-            oof_score, q=np.linspace(0, 1, self.n_bins + 1)
-        )
-        self.bin_edges_ = np.unique(raw_edges)
-
-        # ----- full-data stats -----
-        full_stats = y_used.groupby(key).agg(["mean", "count"])
-        m = self.smoothing
-        full_stats["smoothed"] = (
-            full_stats["count"] * full_stats["mean"] + m * self.global_mean_
-        ) / (full_stats["count"] + m)
-        self.group_stats_ = full_stats[["smoothed", "count"]]
-
-        if self.target_type == "multiclass":
-            self.group_stats_per_class_ = {}
-            for k in range(K):
-                yk = (y_used == k).astype(float)
-                fs = yk.groupby(key).agg(["mean", "count"])
-                fs["smoothed"] = (
-                    fs["count"] * fs["mean"]
-                    + m * self.global_class_means_[k]
-                ) / (fs["count"] + m)
-                self.group_stats_per_class_[k] = fs["smoothed"]
+            out = self.oof_te.fit_transform(key.to_frame(), y)    
+            out.columns = ['TAFC_score']
         
-        full_score = key.map(self.group_stats_["smoothed"]).fillna(self.global_mean_).to_numpy()
-        full_support = key.map(self.group_stats_["count"]).fillna(0).to_numpy()
-
-        bins = np.digitize(oof_score, self.bin_edges_[1:-1], right=True)
-
-        # ----- output -----
-        out = X.copy()
-        if self.return_oof:
-            out["TAFC_score"] = oof_score
-        else:
-            out["TAFC_score"] = full_score
-        if self.add_bins:
-            out["TAFC_bin"] = bins.astype(int)
-        if self.add_support:
-            if self.return_oof:
-                out["TAFC_support"] = oof_support.astype(int)
-            else:
-                out["TAFC_support"] = full_support.astype(int)
-
-        if self.target_type == "multiclass":
-            for k, cls in enumerate(self.classes_):
-                out[f"TAFC_score_class_{cls}"] = oof_class_scores[:, k]
-        out.index = X_index
         return out, dict()
 
     def _transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X_index = X.index   
-        if self.group_stats_ is None:
-            raise RuntimeError("fit_transform must be called first")
-
-        X = X.reset_index(drop=True)
         key = self._make_key(X)
-
-        score = key.map(self.group_stats_["smoothed"])
-        support = key.map(self.group_stats_["count"])
-
-        score = score.fillna(self.global_mean_).to_numpy()
-        support = support.fillna(0).to_numpy()
-        bins = np.digitize(score, self.bin_edges_[1:-1], right=True)
-
-        out = X.copy()
-        out["TAFC_score"] = score
-        if self.add_bins:
-            out["TAFC_bin"] = bins.astype(int)
-        if self.add_support:
-            out["TAFC_support"] = support.astype(int)
-
         if self.target_type == "multiclass":
-            for k, cls in enumerate(self.classes_):
-                s = key.map(self.group_stats_per_class_[k])
-                out[f"TAFC_score_class_{cls}"] = (
-                    s.fillna(self.global_class_means_[k]).to_numpy()
-                )
-        out.index = X_index
+            out = self.oof_te_multi_as_reg.transform(key.to_frame())
+            out.columns = ['TAFC_score']
+            out[[f"TAFC_score_class_{i}" for i in range(self.n_classes_)]] = self.oof_te.transform(key.to_frame())
+        else:
+            out = self.oof_te.transform(key.to_frame())
+            out.columns = ['TAFC_score']
+    
         return out
-
 
     @staticmethod
     def get_default_infer_features_in_args() -> dict:
         return dict(
-            valid_raw_types=[R_OBJECT, R_CATEGORY, R_BOOL, R_INT, R_FLOAT],
-            invalid_special_types=[S_DATETIME_AS_OBJECT, S_IMAGE_PATH, S_IMAGE_BYTEARRAY],
-            # required_raw_special_pairs=[
-            #     (R_BOOL, None),
-            #     (R_OBJECT, None),
-            #     (R_CATEGORY, None),
-            #     # (R_INT, S_BOOL),
-            #     # (R_FLOAT, S_BOOL),
-            # ],
+            # valid_raw_types=[R_OBJECT, R_CATEGORY, R_BOOL, R_INT, R_FLOAT],
+            # invalid_special_types=[S_DATETIME_AS_OBJECT, S_IMAGE_PATH, S_IMAGE_BYTEARRAY],
         )
 
 
@@ -286,13 +130,13 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         target_type: Literal["binary", "multiclass", "regression"],  # "binary", "multiclass", "regression"
         base_tafc_params=None,
         subset_tafc_params=None,
-        n_subsets=50,          # total TAFCs INCLUDING full set
-        subset_size=5,
-        min_subset_size=2,
+        n_subsets=50,          # 50
+        subset_size=None, # 5
+        min_subset_size=2, # 2
         max_subset_size=None,
         random_state=42,
-        use_meta_features=False,
-        drop_raw_rstaf=False,
+        use_meta_features=False, # False
+        drop_raw_rstaf=False, # False
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -448,7 +292,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self.subsets_ = []
         self.tafcs_ = []
 
-        out = X.copy()
+        out = pd.DataFrame(index=X.index)
 
         # ---- 0) Full-feature TAFC (always) ----
         full_subset = tuple(features.tolist())
@@ -566,7 +410,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             raise RuntimeError("Call fit_transform first.")
 
         X = X.reset_index(drop=True)
-        out = X.copy()
+        out = pd.DataFrame(index=X.index)
 
         new_cols = {}
         for i, (subset, tafc) in enumerate(zip(self.subsets_, self.tafcs_)):
@@ -615,14 +459,4 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
 
     @staticmethod
     def get_default_infer_features_in_args() -> dict:
-        return dict(
-            valid_raw_types=[R_OBJECT, R_CATEGORY, R_BOOL, R_INT, R_FLOAT],
-            invalid_special_types=[S_DATETIME_AS_OBJECT, S_IMAGE_PATH, S_IMAGE_BYTEARRAY],
-            # required_raw_special_pairs=[
-            #     (R_BOOL, None),
-            #     (R_OBJECT, None),
-            #     (R_CATEGORY, None),
-            #     # (R_INT, S_BOOL),
-            #     # (R_FLOAT, S_BOOL),
-            # ],
-        )
+        return dict()
