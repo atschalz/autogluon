@@ -18,9 +18,10 @@ class LocalRandomSearcher(LocalSearcher):
 
     MAX_RETRIES = 100
 
-    def __init__(self, *, first_is_default=True, random_seed=0, **kwargs):
+    def __init__(self, *, first_is_default=True, random_seed=0, allow_repetitions=False, **kwargs):
         super().__init__(**kwargs)
         self._first_is_default = first_is_default
+        self._allow_repetitions = allow_repetitions
         # We use an explicit random_state here, in order to better support checkpoint and resume
         self.random_state = np.random.RandomState(random_seed)
         self._params_space = self._get_params_space()
@@ -66,12 +67,13 @@ class LocalRandomSearcher(LocalSearcher):
             new_config = self._params_default
         else:
             new_config = self._sample_config()
-        num_tries = 1
-        while self._pickle_config(new_config) in self._results:
-            if num_tries > self.MAX_RETRIES:
-                if self._num_configs is not None:
-                    num_results = len(self._results)
-                    logger.log(
+        if not self._allow_repetitions:
+            num_tries = 1
+            while self._pickle_config(new_config) in self._results:
+                if num_tries > self.MAX_RETRIES:
+                    if self._num_configs is not None:
+                        num_results = len(self._results)
+                        logger.log(
                         30,
                         f"Stopping HPO due to exhausted search space: {num_results} of {self._num_configs} possible configs ran.",
                     )
