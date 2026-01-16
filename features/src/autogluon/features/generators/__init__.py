@@ -28,6 +28,7 @@ from .oof_target_encoder import (
 )
 from .pipeline import PipelineFeatureGenerator
 from .rename import RenameFeatureGenerator
+from .selection import SpearmanFeatureSelector
 from .tafc import TargetAwareFeatureCompressionFeatureGenerator, RandomSubsetTAFC
 from .text_ngram import TextNgramFeatureGenerator
 from .text_special import TextSpecialFeatureGenerator
