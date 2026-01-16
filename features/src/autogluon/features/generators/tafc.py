@@ -395,7 +395,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         #     X_str = X_str.apply(self.collapse_singletons)
 
         with self.timelog.block("oof-te"):
-            self.subset_oof = OOFTargetEncodingFeatureGenerator(target_type=self.target_type, verbosity=0, alpha=0)
+            self.subset_oof = OOFTargetEncodingFeatureGenerator(target_type=self.target_type, verbosity=0, alpha=0, random_state=self.random_state)
             X_oof = self.subset_oof.fit_transform(X_str, y)
 
         self.col_names = [f"RSTAF_{i}_{i}" for i in range(X_oof.shape[1])]
