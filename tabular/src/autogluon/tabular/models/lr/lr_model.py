@@ -110,6 +110,19 @@ class LinearModel(AbstractModel):
         }.get(self.params.get("handle_text", IGNORE), self._select_features_handle_text_ignore)
         return features_selector(df=df, **kwargs)
 
+    def _get_scaler(self, scaler_name):
+        if scaler_name == 'standard':
+            return StandardScaler()
+        elif scaler_name == 'quantile-normal':
+            from sklearn.preprocessing import QuantileTransformer
+            return QuantileTransformer(output_distribution='normal', random_state=self.random_seed)
+        elif scaler_name == 'quantile-uniform':
+            from sklearn.preprocessing import QuantileTransformer
+            return QuantileTransformer(output_distribution='uniform', random_state=self.random_seed)
+        elif scaler_name == 'squashing':
+            from autogluon.features.generators.skrub._squashing_scaler import SquashingScaler
+            return SquashingScaler()
+
     # TODO: handle collinear features - they will impact results quality
     def _preprocess(self, X, is_train=False, **kwargs):
         if is_train:
@@ -148,12 +161,12 @@ class LinearModel(AbstractModel):
             pipeline = Pipeline(
                 steps=[
                     ("imputer", SimpleImputer(strategy=self.params["proc.impute_strategy"])),
-                    ("scaler", StandardScaler()),
+                    ("scaler", self._get_scaler(self.params.get("scaler", "standard"))),
                 ]
             )
             transformer_list.append(("cont", pipeline, feature_types["continuous"]))
         if feature_types.get("bool", None):
-            pipeline = Pipeline(steps=[("scaler", StandardScaler())])
+            pipeline = Pipeline(steps=[("scaler", self._get_scaler(self.params.get("scaler", "standard")))])
             transformer_list.append(("bool", pipeline, feature_types["bool"]))
         if feature_types.get("skewed", None):
             pipeline = Pipeline(
@@ -161,7 +174,8 @@ class LinearModel(AbstractModel):
                     ("imputer", SimpleImputer(strategy=self.params["proc.impute_strategy"])),
                     (
                         "quantile",
-                        QuantileTransformer(output_distribution="normal"),
+                        self._get_scaler(self.params.get("scaler", "standard")),
+                        # QuantileTransformer(output_distribution="normal"),
                     ),  # Or output_distribution = 'uniform'
                 ]
             )
@@ -182,6 +196,7 @@ class LinearModel(AbstractModel):
 
     def _fit(self, X, y, time_limit=None, num_cpus=-1, sample_weight=None, **kwargs):
         time_fit_start = time.time()
+        
         X = self.preprocess(X, y=y, is_train=True)
         if self.problem_type == BINARY:
             y = y.astype(int).values
@@ -190,6 +205,24 @@ class LinearModel(AbstractModel):
         if "n_jobs" not in params:
             if self.problem_type != REGRESSION:
                 params["n_jobs"] = num_cpus
+
+        # TODO: Needs to differ depending on L1/L2 & Class./Reg.
+        if params['C'] == 'auto':
+            # Automatically set C based on number of features
+            n_features = X.shape[1]
+            if n_features > 1000:
+                params['C'] = 0.001
+            if n_features > 500:
+                params['C'] = 0.01
+            elif n_features > 100:
+                params['C'] = 0.1
+            # elif n_features <= 500:
+            #     params['C'] = 0.01
+            # elif params['C'] > 100:
+            #     params['C'] = 0.1
+            else:
+                params['C'] = 1.0
+        params['C'] *= self.params.get('C_scale', 1)
 
         # Ridge/Lasso are using alpha instead of C, which is C^-1
         # https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Ridge.html#sklearn.linear_model.Ridge
@@ -226,6 +259,8 @@ class LinearModel(AbstractModel):
 
         if len(max_iter_list) > 1:
             params["warm_start"] = True  # Force True
+
+            logger.log(15, f"Auto-set regularization parameter C to {params['C']} based on {n_features} features.")
 
         total_iter = 0
         total_iter_used = 0

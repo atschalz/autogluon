@@ -15,12 +15,15 @@ preprocess_params_set = {
     "proc.impute_strategy",
     "penalty",
     "handle_text",
+    "scaler",
+    "C_scale", # not really preprocessing but is added here for convenience
 }
 
 
 def get_param_baseline():
     default_params = {
-        "C": 1,
+        "C": "auto",
+        "C_scale": 1,
         "vectorizer_dict_size": 75000,  # size of TFIDF vectorizer dictionary; used only in text model
         "proc.ngram_range": (1, 5),  # range of n-grams for TFIDF vectorizer dictionary; used only in text model
         "proc.skew_threshold": 0.99,  # numerical features whose absolute skewness is greater than this receive special power-transform preprocessing. Choose big value to avoid using power-transforms
