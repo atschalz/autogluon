@@ -203,6 +203,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self,
         target_type: Literal["binary", "multiclass", "regression"],
         only_cat: bool = False,
+        binary_as_cat: bool = True,
         max_cardinality: Optional[int] = None,
         round_numerical: Optional[int] = 2,
         n_subsets: int = 50,
@@ -222,6 +223,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self.max_subset_size = max_subset_size
         self.random_state = int(random_state)
         self.only_cat = bool(only_cat)
+        self.binary_as_cat = bool(binary_as_cat)
         self.max_cardinality = int(max_cardinality) if max_cardinality is not None else None
         self.round_numerical = int(round_numerical) if round_numerical is not None else None
 
@@ -326,6 +328,10 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         # Select columns
         if self.only_cat:
             cols = X.select_dtypes(include=["object", "category"]).columns
+            numeric_cols = X.select_dtypes(include=["number"]).columns
+            if self.binary_as_cat:
+                binary_cols = X.select_dtypes(include=["number"]).columns[X[numeric_cols].nunique() <= 2] # NOTE: uniform may occur at test, hence <=, should generally make train/test prepare versions
+                cols = cols.union(binary_cols)
         else:
             cols = X.columns
 
