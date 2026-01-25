@@ -211,6 +211,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         min_subset_size: int = 2,
         max_subset_size: Optional[int] = None,
         max_base_feats_to_consider: Optional[int] = 150,
+        select_for_multiclass: bool = False,  
         random_state: int = 42,
         **kwargs,
     ):
@@ -226,6 +227,7 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         self.binary_as_cat = bool(binary_as_cat)
         self.max_cardinality = int(max_cardinality) if max_cardinality is not None else None
         self.round_numerical = int(round_numerical) if round_numerical is not None else None
+        self.select_for_multiclass = bool(select_for_multiclass)  
 
         self.max_base_feats_to_consider = (
             int(max_base_feats_to_consider) if max_base_feats_to_consider is not None else None
@@ -404,8 +406,14 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
             self.subset_oof = OOFTargetEncodingFeatureGenerator(target_type=self.target_type, verbosity=0, alpha=0, random_state=self.random_state)
             X_oof = self.subset_oof.fit_transform(X_str, y)
 
-        self.col_names = [f"RSTAF_{i}_{i}" for i in range(X_oof.shape[1])]
+        self.col_names = [f"RSTAF_{i}" for i in range(X_oof.shape[1])]
         X_oof.columns = self.col_names
+
+        if self.select_for_multiclass and self.target_type == "multiclass":
+            y_corrs = pd.get_dummies(y).apply(lambda y_: X_oof.corrwith(y_))
+            best_corr_rank = y_corrs.abs().rank().min(axis=1)
+            self.selected_cols = best_corr_rank.index[best_corr_rank<self.n_subsets]
+            X_oof = X_oof[self.selected_cols]
 
         return X_oof, {}
 
@@ -418,6 +426,8 @@ class RandomSubsetTAFC(AbstractFeatureGenerator):
         with self.timelog.block("transform_oof-transform"):
             out = self.subset_oof.transform(X_str)
             out.columns = self.col_names
+        if self.select_for_multiclass and self.target_type == "multiclass":
+           out = out[self.selected_cols]
         return out
 
     @staticmethod
