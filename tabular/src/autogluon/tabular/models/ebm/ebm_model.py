@@ -72,7 +72,7 @@ class EBMModel(AbstractModel):
         **kwargs,
     ):
         # Preprocess data.
-        X = self.preprocess(X, y=y)
+        X = self.preprocess(X, y=y, is_train=True)
         if X_val is not None:
             X_val = self.preprocess(X_val)
 

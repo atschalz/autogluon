@@ -27,6 +27,7 @@ from .oof_target_encoder import (
     OOFTargetEncodingFeatureGenerator,
 )
 from .pipeline import PipelineFeatureGenerator
+from .random_noise import RandomNoiseFeatureGenerator
 from .rename import RenameFeatureGenerator
 from .selection import SpearmanFeatureSelector
 from .tafc import TargetAwareFeatureCompressionFeatureGenerator, RandomSubsetTAFC
@@ -65,6 +66,7 @@ REGISTERED_FE_CLS_LST = [
     OOFTargetEncodingFeatureGenerator,
     SpearmanFeatureSelector,
     PipelineFeatureGenerator,
+    RandomNoiseFeatureGenerator,
     RandomSubsetTAFC,
     RenameFeatureGenerator,
     TargetAwareFeatureCompressionFeatureGenerator,
